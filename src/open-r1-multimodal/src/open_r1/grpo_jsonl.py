@@ -32,14 +32,16 @@ from open_r1.utils.pycocotools.coco import COCO
 from open_r1.utils.pycocotools.cocoeval import COCOeval
 import json
 import math
-from json_repair import repair_json
+# from json_repair import repair_json
 
 from open_r1.vlm_modules import *
 
 from typing import Tuple
 from transformers.utils import logging
 from transformers import AutoProcessor, AutoTokenizer
-
+import re  # 用于正则表达式匹配
+from geopy.distance import geodesic  # 用于地理距离计算
+import math
 from openai import OpenAI
 
 logger = logging.get_logger(__name__)
@@ -428,6 +430,49 @@ def iou(box1, box2):
     return float(inter)/union
 
 
+# def detect_reward(content, sol, iou_threshold=0.35, alpha=0.7, beta=0.0, gamma=0.3):
+#     region_match = re.search(r'<region>bbox_2d\s*:\s*{\[([^\]]+)\]}\s*</region>', content)
+#     sol_region_match = re.search(r'<answer>\s*bbox_2d\s*:\s*{\[([^\]]+)\]}\s*</answer>', sol)
+#     if not region_match or not sol_region_match:
+#         print(f"Region match not found in content or solution. Content: {content}, Solution: {sol}")
+#         return 0.0
+    
+#     # 提取字符串并转换为整数列表 [x1, y1, x2, y2]
+#     bbox_pred = list(map(int, region_match.group(1).strip().split(',')))
+#     bbox_gt = list(map(int, sol_region_match.group(1).strip().split(',')))
+#     print(f"Predicted bbox: {bbox_pred}, Ground truth bbox: {bbox_gt}")
+#     iou_cur = iou(bbox_pred, bbox_gt)  # 确保 iou() 函数接收的是列表而非字符串
+
+#     if iou_cur < iou_threshold:
+#         return 0.0
+#     else:
+#         return 1.0
+
+def detect_reward(content, sol, iou_threshold=0.35, alpha=0.7, beta=0.0, gamma=0.3):
+    # 修改正则表达式以匹配可能存在的额外内容
+    region_match = re.search(r'<region>bbox_2d\s*:\s*{\[([^\]]+)\]}.*?</region>', content)
+    sol_region_match = re.search(r'<answer>\s*bbox_2d\s*:\s*{\[([^\]]+)\]}\s*</answer>', sol)
+    
+    if not region_match or not sol_region_match:
+        print(f"Region match not found in content or solution. Content: {content}, Solution: {sol}")
+        return 0.0
+    
+    try:
+        # 提取字符串并转换为整数列表 [x1, y1, x2, y2]
+        bbox_pred = list(map(int, region_match.group(1).replace(" ", "").split(',')))
+        bbox_gt = list(map(int, sol_region_match.group(1).replace(" ", "").split(',')))
+    except:
+        print(f"Error parsing bounding boxes. Content: {content}, Solution: {sol}")
+        return 0.0
+
+    print(f"Predicted bbox: {bbox_pred}, Ground truth bbox: {bbox_gt}")
+    iou_cur = iou(bbox_pred, bbox_gt)
+
+    if iou_cur < iou_threshold:
+        return iou_cur
+    else:
+        return 1.0
+    
 def detection_score(content, sol, iou_threshold=0.5, alpha=0.7, beta=0.0, gamma=0.3):
     pattern = r'```json(.*?)```'
     json_match = re.search(pattern, clean_text(content), re.DOTALL)
@@ -823,6 +868,74 @@ def default_accuracy_reward(content, sol, **kwargs):
 
     return reward
 
+def geo_reward(content, sol, **kwargs):
+    def parse_coordinates(text):
+        # 统一解析函数，支持两种格式：
+        # 1. 键值对（如 "Latitude: 40.7, Longitude: -73.9"）
+        # 2. 列表（如 [40.7, -73.9]）
+        text = text.strip()
+        
+        # 尝试提取键值对
+        lat_match = re.search(
+            r'(?:Latitude|纬度)\s*[=:：]?\s*(-?\d+\.?\d*)', 
+            text, 
+            re.IGNORECASE
+        )
+        lon_match = re.search(
+            r'(?:Longitude|经度)\s*[=:：]?\s*(-?\d+\.?\d*)', 
+            text, 
+            re.IGNORECASE
+        )
+        if lat_match and lon_match:
+            return float(lat_match.group(1)), float(lon_match.group(1))
+        
+        # 尝试提取列表格式
+        numbers = re.findall(r'-?\d+\.?\d*', text)
+        if len(numbers) >= 2:
+            return float(numbers[0]), float(numbers[1])
+        
+        return None, None
+
+    # 解析真实答案（sol）
+    try:
+        sol_answer = re.search(r'<answer>(.*?)</answer>', sol, re.DOTALL)
+        sol_text = sol_answer.group(1).strip() if sol_answer else sol
+        lat_gt, lon_gt = parse_coordinates(sol_text)
+        if lat_gt is None or lon_gt is None:
+            return 0.0
+    except:
+        return 0.0
+
+    # 解析预测答案（content）
+    content_answer = re.search(r'<answer>(.*?)</answer>', content, re.DOTALL)
+    if not content_answer:
+        return 0.0
+    answer_text = content_answer.group(1).strip()
+    
+    lon_pred, lat_pred = parse_coordinates(answer_text)
+    print(lat_gt, lon_gt, lat_pred, lon_pred)
+    if lat_pred is None or lon_pred is None:
+        return 0.0
+
+    # 坐标有效性验证
+    if not (-90 <= lat_pred <= 90) or not (-180 <= lon_pred <= 180):
+        return 0.0
+
+    # 计算地理距离
+    try:
+        distance = geodesic((lat_gt, lon_gt), (lat_pred, lon_pred)).kilometers
+        print(distance)
+    except:
+        return 0.0
+
+    # 使用自然常数 e 的奖励函数
+    try:
+        reward =  2 / (1 + math.e ** (distance / 25))
+    except:
+        return 0.0
+    
+    return reward
+
 def accuracy_reward(completions, solution, **kwargs):
     """Reward function that checks if the completion is correct using symbolic verification, exact string matching, or fuzzy matching."""
     contents = [completion[0]["content"] for completion in completions]
@@ -857,6 +970,10 @@ def accuracy_reward(completions, solution, **kwargs):
             reward = odLength_reward(content, sol)
         elif accu_reward_method == 'all_match':
             reward = all_match_reward(content, sol)
+        elif accu_reward_method == 'geo_reason':
+            reward = geo_reward(content, sol)
+        elif accu_reward_method == 'ai_detect':
+            reward = detect_reward(content, sol)
         else:
             reward = default_accuracy_reward(content, sol)  
         rewards.append(reward)
@@ -879,9 +996,28 @@ def accuracy_reward(completions, solution, **kwargs):
     return rewards
 
 
+# def format_reward(completions, **kwargs):
+#     """Reward function that checks if the completion has a specific format."""
+#     # pattern = r"<think>.*?</think>\s*<answer>.*?</answer>"
+#     pattern = r"<think>.*?</think>.*?<answer>.*?</answer>"
+#     completion_contents = [completion[0]["content"] for completion in completions]
+#     matches = [re.fullmatch(pattern, content, re.DOTALL) for content in completion_contents]
+
+#     current_time = datetime.now().strftime("%d-%H-%M-%S-%f")
+#     if os.getenv("DEBUG_MODE") == "true":
+#         log_path = os.getenv("LOG_PATH")
+#         with open(log_path.replace(".txt", "_format.txt"), "a", encoding='utf-8') as f:
+#             f.write(f"------------- {current_time} Format reward -------------\n")
+#             for content, match in zip(completion_contents, matches):
+#                 f.write(f"Content: {content}\n")
+#                 f.write(f"Has format: {bool(match)}\n")
+
+#     return [1.0 if match else 0.0 for match in matches]
+
 def format_reward(completions, **kwargs):
     """Reward function that checks if the completion has a specific format."""
-    pattern = r"<think>.*?</think>\s*<answer>.*?</answer>"
+    # pattern = r"<think>.*?</think>\s*<answer>.*?</answer>"
+    pattern = r"<think>.*?</think>.*?<region>.*?</region>.*?<answer>.*?</answer>.*?<tool>.*?</tool>"
     completion_contents = [completion[0]["content"] for completion in completions]
     matches = [re.fullmatch(pattern, content, re.DOTALL) for content in completion_contents]
 
@@ -923,6 +1059,145 @@ def get_vlm_module(model_name_or_path):
         return InvernVLModule
     else:
         raise ValueError(f"Unsupported model: {model_name_or_path}")
+
+# def main(script_args, training_args, model_args):
+#     # Load the VLM module
+#     vlm_module_cls = get_vlm_module(model_args.model_name_or_path)
+#     print("using vlm module:", vlm_module_cls.__name__)
+#     question_prompt = vlm_module_cls.get_question_template(task_type=script_args.task_type)
+
+#     # Get reward functions 
+#     if script_args.is_reward_customized_from_vlm_module:
+#         reward_funcs = [vlm_module_cls.select_reward_func(func, script_args.task_type) for func in script_args.reward_funcs]
+#     else:
+#         reward_funcs = [reward_funcs_registry[func] for func in script_args.reward_funcs]
+#     print("reward_funcs:", reward_funcs)
+
+#     # Load the JSONL datasets
+#     import json
+#     from datasets import Dataset
+    
+#     data_files = script_args.data_file_paths.split(":")
+#     image_folders = script_args.image_folders.split(":")
+
+#     if len(data_files) != len(image_folders):
+#         raise ValueError("Number of data files must match number of image folders")
+    
+#     if script_args.reward_method is None:
+#         accu_reward_methods = ["default"] * len(data_files)
+#     else:
+#         accu_reward_methods = script_args.reward_method.split(":")
+#         assert len(accu_reward_methods) == len(data_files), f"Number of reward methods must match number of data files: {len(accu_reward_methods)} != {len(data_files)}"
+
+    
+#     if len(data_files) != len(image_folders):
+#         raise ValueError("Number of data files must match number of image folders")
+    
+#     all_data = []
+#     for data_file, image_folder, accu_reward_method in zip(data_files, image_folders, accu_reward_methods):
+#         with open(data_file, 'r') as f:
+#             for line in f:
+#                 item = json.loads(line)
+#                 if 'image' in item:
+#                     if isinstance(item['image'], str):
+#                         # Store image path instead of loading the image
+#                         item['image_path'] = [os.path.join(image_folder, item['image'])]
+#                         del item['image'] # remove the image column so that it can be loaded later
+#                     elif isinstance(item['image'], list):
+#                         # if the image is a list, then it is a list of images (for multi-image input)
+#                         item['image_path'] = [os.path.join(image_folder, image) for image in item['image']]
+#                         del item['image'] # remove the image column so that it can be loaded later
+#                     else:
+#                         raise ValueError(f"Unsupported image type: {type(item['image'])}")
+#                 # Remove immediate image loading
+#                 item['problem'] = item['conversations'][0]['value'].replace('<image>', '')
+                
+#                 # Handle solution that could be a float or string
+#                 solution_value = item['conversations'][1]['value']
+#                 if isinstance(solution_value, str):
+#                     item['solution'] = solution_value.replace('<answer>', '').replace('</answer>', '').strip()
+#                 else:
+#                     # If it's a float or other non-string type, keep it as is
+#                     item['solution'] = str(solution_value)
+                
+#                 del item['conversations']
+#                 item['accu_reward_method'] = item.get('accu_reward_method', accu_reward_method) # if accu_reward_method is in the data jsonl, use the value in the data jsonl, otherwise use the defined value
+#                 all_data.append(item)
+
+#     dataset = Dataset.from_list(all_data)
+
+#     def make_conversation_from_jsonl(example):
+#         if 'image_path' in example and example['image_path'] is not None:
+#             assert all(os.path.exists(p) for p in example['image_path']), f"Image paths do not exist: {example['image_path']}"
+#             # Don't load image here, just store the path
+#             return {
+#                 'image_path': [p for p in example['image_path']],  # Store path instead of loaded image
+#                 'problem': example['problem'],
+#                 'solution': f"<answer> {example['solution']} </answer>",
+#                 'accu_reward_method': example['accu_reward_method'],
+#                 'prompt': [{
+#                     'role': 'user',
+#                     'content': [
+#                         *({'type': 'image', 'text': None} for _ in range(len(example['image_path']))),
+#                         {'type': 'text', 'text': question_prompt.format(Question=example['problem'])}
+#                     ]
+#                 }]
+#             }
+#         else:
+#             return {
+#                 'problem': example['problem'],
+#                 'solution': f"<answer> {example['solution']} </answer>",
+#                 'accu_reward_method': example['accu_reward_method'],
+#                 'prompt': [{
+#                     'role': 'user',
+#                     'content': [
+#                         {'type': 'text', 'text': question_prompt.format(Question=example['problem'])}
+#                     ]
+#                 }]
+#             }
+
+#     # Map the conversations
+#     dataset = dataset.map(make_conversation_from_jsonl, num_proc=8)
+
+#     # Split dataset for validation if requested
+#     splits = {'train': dataset}
+#     if script_args.val_split_ratio > 0:
+#         train_val_split = dataset.train_test_split(
+#             test_size=script_args.val_split_ratio
+#         )
+#         splits['train'] = train_val_split['train']
+#         splits['validation'] = train_val_split['test']
+
+#     # Select trainer class based on vlm_trainer argument
+#     trainer_cls = VLMGRPOTrainer
+#     print("using trainer:", trainer_cls.__name__)
+#     initialize_tokenizer(model_args.model_name_or_path)
+#     # Initialize the GRPO trainer
+#     trainer = trainer_cls(
+#         model=model_args.model_name_or_path,
+#         reward_funcs=reward_funcs,
+#         args=training_args,
+#         vlm_module=vlm_module_cls(),
+#         train_dataset=splits['train'],
+#         eval_dataset=splits.get('validation') if training_args.eval_strategy != "no" else None,
+#         peft_config=get_peft_config(model_args),
+#         freeze_vision_modules=model_args.freeze_vision_modules,
+#         attn_implementation=model_args.attn_implementation,
+#         max_pixels=script_args.max_pixels,
+#         min_pixels=script_args.min_pixels,
+#         max_anyres_num=script_args.max_anyres_num,
+#     )
+
+#     # Train and push the model to the Hub
+#     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
+#         trainer.train(resume_from_checkpoint=True)
+#     else:
+#         trainer.train()
+
+#     # Save and push to hub
+#     trainer.save_model(training_args.output_dir)
+#     if training_args.push_to_hub:
+#         trainer.push_to_hub()
 
 def main(script_args, training_args, model_args):
     # Load the VLM module
@@ -974,17 +1249,17 @@ def main(script_args, training_args, model_args):
                     else:
                         raise ValueError(f"Unsupported image type: {type(item['image'])}")
                 # Remove immediate image loading
-                item['problem'] = item['conversations'][0]['value'].replace('<image>', '')
+                item['problem'] = item['conversations'][0]['value'].replace('<image>', '') + " " + item['conversations'][1]['value'].replace('<image>', '') + " " + item['conversations'][2]['value'].replace('<image>', '')
                 
                 # Handle solution that could be a float or string
-                solution_value = item['conversations'][1]['value']
+                solution_value = item['conversations'][-1]['value']
                 if isinstance(solution_value, str):
                     item['solution'] = solution_value.replace('<answer>', '').replace('</answer>', '').strip()
                 else:
                     # If it's a float or other non-string type, keep it as is
                     item['solution'] = str(solution_value)
                 
-                del item['conversations']
+                # del item['conversations']
                 item['accu_reward_method'] = item.get('accu_reward_method', accu_reward_method) # if accu_reward_method is in the data jsonl, use the value in the data jsonl, otherwise use the defined value
                 all_data.append(item)
 
@@ -994,19 +1269,67 @@ def main(script_args, training_args, model_args):
         if 'image_path' in example and example['image_path'] is not None:
             assert all(os.path.exists(p) for p in example['image_path']), f"Image paths do not exist: {example['image_path']}"
             # Don't load image here, just store the path
+            # return {
+            #     'image_path': [p for p in example['image_path']],  # Store path instead of loaded image
+            #     'problem': example['problem'],
+            #     'solution': f"<answer> {example['solution']} </answer>",
+            #     'accu_reward_method': example['accu_reward_method'],
+            #     'prompt': [{
+            #         'role': 'user',
+            #         'content': [
+            #             *({'type': 'image', 'text': None} for _ in range(len(example['image_path']))),
+            #             {'type': 'text', 'text': question_prompt.format(Question=example['problem'])}
+            #         ]
+            #     }]
+            # }
+            prompt = [
+                {
+                    'role': 'user',
+                    'content': [
+                        {'type': 'image', 'text': None},
+                        {'type': 'text', 'text': question_prompt.format(Question=example['conversations'][0]['value'])}
+                    ]
+                },
+                {
+                    'role': 'assistant',
+                    'content': [
+                        {'type': 'text', 'text': question_prompt.format(Question=example['conversations'][1]['value'])}  # Empty text for assistant image responses
+                    ]
+                },
+                {
+                    'role': 'user',
+                    'content': [
+                        {'type': 'image', 'text': None},
+                        {'type': 'text', 'text': question_prompt.format(Question=example['conversations'][2]['value'])}
+                    ]
+                }
+            ]
+
+            # for img_path in example['image_path'][1:]:
+            #     prompt.append(
+            #         {
+            #             'role': 'assistant',
+            #             'content': [
+            #                 {'type': 'text', 'text': example['conversations'][1]['value']}  # Empty text for assistant image responses
+            #             ]
+            #         },
+            #         {
+            #             'role': 'user',
+            #             'content': [
+            #                 {'type': 'image', 'text': None},
+            #                 {'type': 'text', 'text': example['conversations'][2]['value']}
+            #             ]
+            #         }
+            #     )
+
             return {
                 'image_path': [p for p in example['image_path']],  # Store path instead of loaded image
                 'problem': example['problem'],
                 'solution': f"<answer> {example['solution']} </answer>",
                 'accu_reward_method': example['accu_reward_method'],
-                'prompt': [{
-                    'role': 'user',
-                    'content': [
-                        *({'type': 'image', 'text': None} for _ in range(len(example['image_path']))),
-                        {'type': 'text', 'text': question_prompt.format(Question=example['problem'])}
-                    ]
-                }]
+                'prompt': prompt
             }
+
         else:
             return {
                 'problem': example['problem'],
@@ -1062,7 +1385,6 @@ def main(script_args, training_args, model_args):
     trainer.save_model(training_args.output_dir)
     if training_args.push_to_hub:
         trainer.push_to_hub()
-
 
 if __name__ == "__main__":
     parser = TrlParser((GRPOScriptArguments, GRPOConfig, GRPOModelConfig))

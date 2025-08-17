@@ -525,6 +525,7 @@ class VLMGRPOTrainer(Trainer):
         prompts_text = self.vlm_module.prepare_prompt(self.processing_class, inputs)
         # Handle both pre-loaded images and image paths
         images = []
+        image_counts = []
         for x in inputs:
             if "image" in x:
                 imgs = self._get_key_from_inputs(x, "image")
@@ -533,6 +534,7 @@ class VLMGRPOTrainer(Trainer):
             else:
                 imgs = []
 
+            image_counts.append(len(imgs))
             for img in imgs:
                 try:
                     # Ensure minimum dimensions of 28 pixels
@@ -541,11 +543,11 @@ class VLMGRPOTrainer(Trainer):
                     # Calculate new dimensions maintaining aspect ratio
                         if w < h:
                             new_w = 28
-                            new_h = int(h * (28/w))
+                            new_h = int(h * (28 / w))
                         else:
                             new_h = 28
-                            new_w = int(w * (28/h))
-                    img = img.resize((new_w, new_h), PIL.Image.Resampling.LANCZOS)
+                            new_w = int(w * (28 / h))
+                        img = img.resize((new_w, new_h), PIL.Image.Resampling.LANCZOS)
                 except:
                     pass
                 images.append(img)
@@ -565,9 +567,35 @@ class VLMGRPOTrainer(Trainer):
 
         # image_grid_thw may be needed for the reward function
         if additional_output is not None:
-            assert len(additional_output) == len(inputs)
-            for i, (input_i, additional_output_i) in enumerate(zip(inputs, additional_output)):
-                input_i.update(additional_output_i)
+            # assert len(additional_output) == len(inputs)
+            # for i, (input_i, additional_output_i) in enumerate(zip(inputs, additional_output)):
+            #     input_i.update(additional_output_i)
+
+            # Some processors (e.g., Qwen2-VL) return per-image metadata (len == total images),
+            # while our inputs is per-sample. Regroup to per-sample using image_counts and keep the first image's info.
+            if len(additional_output) != len(inputs):
+                total_images = sum(image_counts)
+                if len(additional_output) == total_images:
+                    grouped = []
+                    idx = 0
+                    for cnt in image_counts:
+                        if cnt <= 0:
+                            grouped.append({})
+                        else:
+                            # If multiple images per sample, pick the first one's metadata by default
+                            grouped.append(additional_output[idx])
+                            idx += cnt
+                    additional_output = grouped
+                else:
+                    # Fallback: pad/truncate to match inputs length to avoid crashing
+                    if len(additional_output) < len(inputs):
+                        additional_output = additional_output + [{}] * (len(inputs) - len(additional_output))
+                    else:
+                        additional_output = additional_output[: len(inputs)]
+
+            for input_i, additional_output_i in zip(inputs, additional_output):
+                if isinstance(additional_output_i, dict) and len(additional_output_i) > 0:
+                    input_i.update(additional_output_i)
 
 
         # max_prompt_length is not supported yet
